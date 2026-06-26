@@ -1,6 +1,8 @@
 import { DirectoryBasePaths, Files } from "./Files";
 
 
+// Need to know which VMs were opened by a VM, and close them when that VM is closed
+
 export class JSVM {
   vmID: number | undefined;
   isRunning: boolean;
