@@ -68,7 +68,7 @@ export const BuildModeSettings = {
 
   // --- Zoom readout (the "14.5x" panel) ---
   /** Show the zoom indicator while pinching. */
-  showZoomLabel: true,
+  showZoomLabel: false, // TEMP: off while we isolate the on-enter crash
   /** Metres in front of your head to float the readout. */
   zoomLabelDistance: 1.5,
   /** Metres below eye level for the readout. */
@@ -80,7 +80,7 @@ export const BuildModeSettings = {
 
   // --- Exit spawn reticle ---
   /** Show the spawn ring while aiming with hands free. */
-  showReticle: true,
+  showReticle: false, // TEMP: off while we isolate the on-enter crash
   /** On exit, teleport to the ring you are pointing at (if any). */
   teleportOnExit: true,
   /** Aim the spawn ring with the right hand (false = left hand). */
