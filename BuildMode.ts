@@ -1,9 +1,15 @@
+import { Color } from "./Yuu API/Basic Types/Color";
 import { Quaternion } from "./Yuu API/Basic Types/Quaternion";
+import { Vector2 } from "./Yuu API/Basic Types/Vector2";
 import { Vector3 } from "./Yuu API/Basic Types/Vector3";
+import { Billboard } from "./Yuu API/Billboard";
 import { Controller } from "./Yuu API/Controller";
+import { Entity } from "./Yuu API/Entity";
 import { Events } from "./Yuu API/Events";
 import { Player } from "./Yuu API/Player";
+import { Raycast } from "./Yuu API/Raycast";
 import { registerStart } from "./Yuu API/RegisterStart";
+import { spawnPrimitive } from "./Yuu API/SpawnPrimitive";
 
 
 /**
@@ -14,12 +20,16 @@ import { registerStart } from "./Yuu API/RegisterStart";
  *
  * CONTROLS
  *  - Toggle on / off : click BOTH thumbsticks in at the same time.
+ *                      On exit you spawn at the ring you are pointing at (if any).
  *  - Move            : hold ONE grip and move your hand. The world stays stuck to
  *                      your hand, pulling you through space (grab & drag).
  *  - Rotate          : hold BOTH grips and twist. The world yaws to follow the line
  *                      between your hands.
  *  - Zoom            : hold BOTH grips and spread / squeeze your hands. Pinch to zoom
- *                      in and out, clamped between a min and a max.
+ *                      in and out, clamped between a min and a max. The current zoom is
+ *                      shown as a "x" readout in front of you.
+ *  - Aim spawn       : with hands free, point your aiming hand at the world. A ring
+ *                      shows where you will land when you leave build mode.
  *
  * WHY IT IS BUILT THIS WAY (API constraints)
  *  - Godot.events.onControllerInput only reports button *presses*; there is no
@@ -53,6 +63,29 @@ export const BuildModeSettings = {
   rotateSensitivity: 1,
   /** Hold the rig in place against gravity / ground-snap while build mode is active. */
   holdAgainstGravity: true,
+
+  // --- Zoom readout (the "14.5x" panel) ---
+  /** Show the zoom indicator while pinching. */
+  showZoomLabel: true,
+  /** Metres in front of your head to float the readout. */
+  zoomLabelDistance: 1.5,
+  /** Metres below eye level for the readout. */
+  zoomLabelHeightOffset: -0.15,
+  /** Keep the readout up this long (ms) after the last pinch frame. */
+  zoomLabelLingerMs: 900,
+  /** Font size for the readout. */
+  zoomLabelFontSize: 6,
+
+  // --- Exit spawn reticle ---
+  /** On exit, teleport to the ring you are pointing at (if any). */
+  teleportOnExit: true,
+  /** Aim the spawn ring with the right hand (false = left hand). */
+  aimWithRightHand: true,
+  /** Max distance (metres) the spawn ray reaches. */
+  reticleMaxDistance: 1000,
+  /** Nudge the spawn point up / down if you land too low or high. */
+  spawnYOffset: 0,
+
   /** Print "Build Mode: ON/OFF" to the console when toggled. */
   logToggles: true,
 };
@@ -64,12 +97,14 @@ export const BuildModeSettings = {
 export const BuildMode = {
   /** Turn build mode on. */
   enable,
-  /** Turn build mode off. */
+  /** Turn build mode off (teleports to the aimed ring if there is one). */
   disable,
   /** Flip build mode on / off. */
   toggle,
   /** @returns true while build mode is active. */
   isActive: (): boolean => active,
+  /** @returns the current zoom level (1 = zoom on entry). */
+  getZoom: (): number => zoomLevel,
 };
 
 
@@ -100,6 +135,14 @@ function disable() {
   if (!active) { return; }
 
   active = false; // stop holding -> normal movement + gravity resume
+
+  // Spawn the player at the ring they were pointing at, if any.
+  if (BuildModeSettings.teleportOnExit && spawnTarget) {
+    Player.position.set(spawnTarget.add(new Vector3(0, BuildModeSettings.spawnYOffset, 0)));
+  }
+
+  hideBuildVisuals();
+  spawnTarget = undefined;
 
   if (BuildModeSettings.logToggles) { console.log('Build Mode: OFF'); }
 }
@@ -151,6 +194,20 @@ let zoomLevel = 1;
 
 
 // ---------------------------------------------------------------------------
+// UI state (zoom readout + spawn reticle)
+// ---------------------------------------------------------------------------
+let zoomLabel: Entity | undefined;        // background panel
+let zoomLabelTextEntity: Entity | undefined; // child text node
+let zoomVisibleUntil = 0;                  // timestamp the readout stays up until
+
+let reticle: Entity | undefined;           // ring marker on the ground
+let spawnTarget: Vector3 | undefined;      // where the ray currently hits
+
+const RETICLE_COLOR = new Color(0.29, 0.45, 1);
+const LABEL_BG_COLOR = new Color(0.05, 0.05, 0.08);
+
+
+// ---------------------------------------------------------------------------
 // Boot
 // ---------------------------------------------------------------------------
 registerStart(start);
@@ -165,7 +222,7 @@ function start() {
   Controller.subscribe('rightGrip', 'Pressed', () => { rightGripDown = true; });
   Controller.subscribe('rightGrip', 'Released', () => { rightGripDown = false; });
 
-  Events.onUpdate(onUpdate);               // smooth, render-rate locomotion
+  Events.onUpdate(onUpdate);               // smooth, render-rate locomotion + UI
   Events.onPhysicsUpdate(onPhysicsUpdate); // re-assert pose so gravity can't win
 }
 
@@ -202,6 +259,11 @@ function onUpdate(_deltaTime: number) {
   // Hold our pose even when not gripping, so releasing the grips leaves you
   // floating instead of falling.
   holdPose();
+
+  // In-world UI.
+  ensureVisuals();
+  updateReticle(gripCount);
+  updateZoomLabel(gripCount);
 }
 
 
@@ -285,6 +347,137 @@ function twoHandManipulate(leftHand: Vector3, rightHand: Vector3) {
 
   Player.position.set(desiredPos);
   Player.rotation.set(desiredRot);
+}
+
+
+// ---------------------------------------------------------------------------
+// In-world UI: zoom readout + spawn reticle
+// ---------------------------------------------------------------------------
+function ensureVisuals() {
+  if (!zoomLabel) {
+    // Dark panel (no collider, so it never blocks the spawn ray) + white text.
+    zoomLabel = spawnPrimitive.plane('Both', Vector3.zero, new Vector3(0.5, 0.18, 1), Quaternion.one, LABEL_BG_COLOR, 0.72, 'None', 'Empty', undefined);
+
+    const text = new Entity(new Vector3(0, 0, 0.002), Quaternion.one, Vector3.one, zoomLabel, 'Empty');
+    text.text.create('', BuildModeSettings.zoomLabelFontSize, 1);
+    text.text.color.set(Color.white);
+    text.text.outline.set(1);
+    text.text.outline.color.set(Color.black);
+    text.text.doubleSided.set(true);
+    zoomLabelTextEntity = text;
+
+    Billboard.start(zoomLabel, 'Freely'); // always face the player
+    zoomLabel.visible.set(false);
+  }
+
+  if (!reticle) {
+    reticle = new Entity(Vector3.zero, Quaternion.one, Vector3.one, undefined, 'Empty');
+
+    const ring = buildRing(0.30, 0.45, 48);
+    reticle.mesh.create(ring[0], ring[1], ring[2]);
+    reticle.mesh.color.set(RETICLE_COLOR, 1);
+    reticle.mesh.material.emissionColor.set(RETICLE_COLOR);
+    reticle.mesh.material.emissionStrength.set(0.6);
+
+    reticle.visible.set(false);
+  }
+}
+
+
+/** Aim a ray from the chosen hand to the world and park the ring at the hit. */
+function updateReticle(gripCount: number) {
+  if (!reticle) { return; }
+
+  // Only aim when the hands are free, so the ring doesn't jump around mid-grab.
+  if (gripCount !== 0) {
+    reticle.visible.set(false);
+    return;
+  }
+
+  const hand = BuildModeSettings.aimWithRightHand ? Player.rightHand : Player.leftHand;
+  const from = hand.position.get();
+  const dir = hand.forward.get();
+
+  if (from && dir) {
+    const hit = Raycast.directional(from, dir, BuildModeSettings.reticleMaxDistance, {});
+
+    if (hit) {
+      spawnTarget = hit.pos;
+      reticle.pos = hit.pos.add(new Vector3(0, 0.02, 0)); // lift slightly to avoid z-fighting
+      reticle.visible.set(true);
+      return;
+    }
+  }
+
+  spawnTarget = undefined;
+  reticle.visible.set(false);
+}
+
+
+/** Float the "x" readout in front of the head while zooming. */
+function updateZoomLabel(gripCount: number) {
+  if (!BuildModeSettings.showZoomLabel || !zoomLabel) { return; }
+
+  if (gripCount === 2) {
+    zoomVisibleUntil = Date.now() + BuildModeSettings.zoomLabelLingerMs;
+  }
+
+  const show = Date.now() < zoomVisibleUntil;
+  zoomLabel.visible.set(show);
+
+  if (show) {
+    const head = Player.head.position.get();
+    const forward = Player.head.forward.get();
+
+    if (head && forward) {
+      zoomLabel.pos = head
+        .add(forward.multiply(BuildModeSettings.zoomLabelDistance))
+        .add(new Vector3(0, BuildModeSettings.zoomLabelHeightOffset, 0));
+    }
+
+    if (zoomLabelTextEntity) {
+      zoomLabelTextEntity.text.display.set(zoomLevel.toFixed(1) + 'x');
+    }
+  }
+}
+
+
+function hideBuildVisuals() {
+  if (zoomLabel) { zoomLabel.visible.set(false); }
+  if (reticle) { reticle.visible.set(false); }
+}
+
+
+/** Build a flat ring (annulus) in the XZ plane, double-sided so it always shows. */
+function buildRing(inner: number, outer: number, segments: number): [Vector3[], Vector2[], number[]] {
+  const verts: Vector3[] = [];
+  const uvs: Vector2[] = [];
+  const triangles: number[] = [];
+
+  for (let i = 0; i < segments; i++) {
+    const angle = (i / segments) * Math.PI * 2;
+    const c = Math.cos(angle);
+    const s = Math.sin(angle);
+
+    verts.push(new Vector3(c * outer, 0, s * outer)); // outer ring  (index 2i)
+    verts.push(new Vector3(c * inner, 0, s * inner)); // inner ring  (index 2i + 1)
+
+    uvs.push(new Vector2(i / segments, 1));
+    uvs.push(new Vector2(i / segments, 0));
+  }
+
+  const count = segments * 2;
+  for (let i = 0; i < segments; i++) {
+    const o = (i * 2) % count;
+    const inn = (i * 2 + 1) % count;
+    const oNext = ((i + 1) * 2) % count;
+    const innNext = ((i + 1) * 2 + 1) % count;
+
+    triangles.push(o, oNext, inn, inn, oNext, innNext);     // front
+    triangles.push(inn, oNext, o, innNext, oNext, inn);     // back (double-sided)
+  }
+
+  return [verts, uvs, triangles];
 }
 
 
