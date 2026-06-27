@@ -26,9 +26,16 @@ import { registerStart } from "./Yuu API/RegisterStart";
  *    thumbstick axis, so all locomotion is driven by 6DoF hand motion.
  *  - There is no rig-scaling call, so "zoom" is a clamped dolly (the rig is moved
  *    toward / away from the point between your hands) rather than true world scaling.
+ *  - There is NO API to disable the player's gravity or body collider (Godot.localPlayer
+ *    only exposes position/rotation). So instead of "switching off" gravity, build mode
+ *    OWNS the rig transform while active: it records a desired position and re-asserts
+ *    it every process AND physics frame, so gravity / ground-snap can never pull you
+ *    back down. You float freely; on exit, normal movement and gravity resume.
+ *    (A true "only my hands collide, my body has no collider" would need a new
+ *    engine-side function, like the other C++ TODOs in this codebase.)
  *
- * The grab maths re-derive from a fixed anchor every frame, so movement and rotation
- * self-correct and never drift.
+ * The grab maths re-derive from a fixed world anchor every frame, so movement and
+ * rotation self-correct, never drift, and naturally cancel any gravity nudge.
  */
 
 
@@ -44,6 +51,8 @@ export const BuildModeSettings = {
   zoomSensitivity: 1,
   /** Twist response. 1 = the world turns 1:1 with the twist of your hands. */
   rotateSensitivity: 1,
+  /** Hold the rig in place against gravity / ground-snap while build mode is active. */
+  holdAgainstGravity: true,
   /** Print "Build Mode: ON/OFF" to the console when toggled. */
   logToggles: true,
 };
@@ -66,6 +75,13 @@ export const BuildMode = {
 
 let active = false;
 
+/**
+ * The pose build mode wants the rig to be at. We hold the rig here every frame so
+ * gravity cannot drag us to the floor. The grab gestures update it.
+ */
+let desiredPos: Vector3 = Vector3.zero;
+let desiredRot: Quaternion = Quaternion.one;
+
 function enable() {
   if (active) { return; }
 
@@ -73,13 +89,17 @@ function enable() {
   zoomLevel = 1;        // reset zoom each time you enter
   lastGripCount = -1;   // force grab references to re-seed on the next frame
 
+  // Start holding from wherever we currently are, so entering never snaps you.
+  desiredPos = Player.position.get() ?? desiredPos;
+  desiredRot = Player.rotation.get() ?? desiredRot;
+
   if (BuildModeSettings.logToggles) { console.log('Build Mode: ON'); }
 }
 
 function disable() {
   if (!active) { return; }
 
-  active = false;
+  active = false; // stop holding -> normal movement + gravity resume
 
   if (BuildModeSettings.logToggles) { console.log('Build Mode: OFF'); }
 }
@@ -145,12 +165,13 @@ function start() {
   Controller.subscribe('rightGrip', 'Pressed', () => { rightGripDown = true; });
   Controller.subscribe('rightGrip', 'Released', () => { rightGripDown = false; });
 
-  Events.onUpdate(onUpdate);
+  Events.onUpdate(onUpdate);               // smooth, render-rate locomotion
+  Events.onPhysicsUpdate(onPhysicsUpdate); // re-assert pose so gravity can't win
 }
 
 
 // ---------------------------------------------------------------------------
-// Per-frame locomotion
+// Per-frame locomotion (process / render rate)
 // ---------------------------------------------------------------------------
 function onUpdate(_deltaTime: number) {
   if (!active) {
@@ -177,6 +198,26 @@ function onUpdate(_deltaTime: number) {
   else if (gripCount === 2) {
     if (leftHand && rightHand) { twoHandManipulate(leftHand, rightHand); }
   }
+
+  // Hold our pose even when not gripping, so releasing the grips leaves you
+  // floating instead of falling.
+  holdPose();
+}
+
+
+// ---------------------------------------------------------------------------
+// Per-physics-frame hold (this is what actually beats gravity)
+// ---------------------------------------------------------------------------
+function onPhysicsUpdate(_deltaTime: number) {
+  if (!active) { return; }
+  holdPose();
+}
+
+
+function holdPose() {
+  if (BuildModeSettings.holdAgainstGravity) {
+    Player.position.set(desiredPos);
+  }
 }
 
 
@@ -194,13 +235,15 @@ function seedReferences(leftHand: Vector3 | undefined, rightHand: Vector3 | unde
 
 /**
  * One grip held: drag the world so the grabbed point stays under the hand.
- * Re-derived from a fixed anchor every frame, so it self-corrects and never drifts.
+ * Re-derived from a fixed anchor every frame, so it self-corrects, never drifts,
+ * and cancels any gravity nudge from the previous physics step.
  */
 function dragMove(hand: Vector3) {
   const player = Player.position.get();
   if (!player) { return; }
 
-  Player.position.set(player.add(dragAnchor.subtract(hand)));
+  desiredPos = player.add(dragAnchor.subtract(hand));
+  Player.position.set(desiredPos);
 }
 
 
@@ -230,18 +273,18 @@ function twoHandManipulate(leftHand: Vector3, rightHand: Vector3) {
   prevHandDistance = handDistance;
 
   // Build the new rig pose, all relative to the hand midpoint:
-  //   1) zoom     - move nearer / farther from the midpoint
-  //   2) yaw      - orbit around the midpoint
+  //   1) zoom      - move nearer / farther from the midpoint
+  //   2) yaw       - orbit around the midpoint
   //   3) translate - so the midpoint lands back on the grab anchor
   let rel = player.subtract(mid);
   rel = rel.multiply(1 / dolly);  // zoom in -> dolly > 1 -> move closer
   rel = rotateAroundY(rel, yaw);  // orbit for rotation
-  const newPos = twoHandAnchor.add(rel);
+  desiredPos = twoHandAnchor.add(rel);
 
-  const newRot = Quaternion.fromEuler(new Vector3(0, yaw, 0)).multiply(playerRot);
+  desiredRot = Quaternion.fromEuler(new Vector3(0, yaw, 0)).multiply(playerRot);
 
-  Player.position.set(newPos);
-  Player.rotation.set(newRot);
+  Player.position.set(desiredPos);
+  Player.rotation.set(desiredRot);
 }
 
 
