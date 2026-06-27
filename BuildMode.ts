@@ -2,7 +2,6 @@ import { Color } from "./Yuu API/Basic Types/Color";
 import { Quaternion } from "./Yuu API/Basic Types/Quaternion";
 import { Vector2 } from "./Yuu API/Basic Types/Vector2";
 import { Vector3 } from "./Yuu API/Basic Types/Vector3";
-import { Billboard } from "./Yuu API/Billboard";
 import { Controller } from "./Yuu API/Controller";
 import { Entity } from "./Yuu API/Entity";
 import { Events } from "./Yuu API/Events";
@@ -43,6 +42,9 @@ import { spawnPrimitive } from "./Yuu API/SpawnPrimitive";
  *    back down. You float freely; on exit, normal movement and gravity resume.
  *    (A true "only my hands collide, my body has no collider" would need a new
  *    engine-side function, like the other C++ TODOs in this codebase.)
+ *  - The zoom panel is faced toward you with a safe yaw-only calculation rather than the
+ *    Billboard module: Billboard uses Quaternion.lookAt, which divides by zero (NaN ->
+ *    engine crash) when the panel sits at the world origin and your head is above it.
  *
  * The grab maths re-derive from a fixed world anchor every frame, so movement and
  * rotation self-correct, never drift, and naturally cancel any gravity nudge.
@@ -77,6 +79,8 @@ export const BuildModeSettings = {
   zoomLabelFontSize: 6,
 
   // --- Exit spawn reticle ---
+  /** Show the spawn ring while aiming with hands free. */
+  showReticle: true,
   /** On exit, teleport to the ring you are pointing at (if any). */
   teleportOnExit: true,
   /** Aim the spawn ring with the right hand (false = left hand). */
@@ -137,8 +141,8 @@ function disable() {
   active = false; // stop holding -> normal movement + gravity resume
 
   // Spawn the player at the ring they were pointing at, if any.
-  if (BuildModeSettings.teleportOnExit && spawnTarget) {
-    Player.position.set(spawnTarget.add(new Vector3(0, BuildModeSettings.spawnYOffset, 0)));
+  if (BuildModeSettings.teleportOnExit && spawnTarget && isFiniteVec3(spawnTarget)) {
+    Player.position.set(new Vector3(spawnTarget.x, spawnTarget.y + BuildModeSettings.spawnYOffset, spawnTarget.z));
   }
 
   hideBuildVisuals();
@@ -196,12 +200,12 @@ let zoomLevel = 1;
 // ---------------------------------------------------------------------------
 // UI state (zoom readout + spawn reticle)
 // ---------------------------------------------------------------------------
-let zoomLabel: Entity | undefined;        // background panel
+let zoomLabel: Entity | undefined;           // background panel
 let zoomLabelTextEntity: Entity | undefined; // child text node
-let zoomVisibleUntil = 0;                  // timestamp the readout stays up until
+let zoomVisibleUntil = 0;                     // timestamp the readout stays up until
 
-let reticle: Entity | undefined;           // ring marker on the ground
-let spawnTarget: Vector3 | undefined;      // where the ray currently hits
+let reticle: Entity | undefined;             // ring marker on the ground
+let spawnTarget: Vector3 | undefined;        // where the ray currently hits
 
 const RETICLE_COLOR = new Color(0.29, 0.45, 1);
 const LABEL_BG_COLOR = new Color(0.05, 0.05, 0.08);
@@ -277,7 +281,7 @@ function onPhysicsUpdate(_deltaTime: number) {
 
 
 function holdPose() {
-  if (BuildModeSettings.holdAgainstGravity) {
+  if (BuildModeSettings.holdAgainstGravity && isFiniteVec3(desiredPos)) {
     Player.position.set(desiredPos);
   }
 }
@@ -304,7 +308,10 @@ function dragMove(hand: Vector3) {
   const player = Player.position.get();
   if (!player) { return; }
 
-  desiredPos = player.add(dragAnchor.subtract(hand));
+  const next = player.add(dragAnchor.subtract(hand));
+  if (!isFiniteVec3(next)) { return; }
+
+  desiredPos = next;
   Player.position.set(desiredPos);
 }
 
@@ -341,8 +348,11 @@ function twoHandManipulate(leftHand: Vector3, rightHand: Vector3) {
   let rel = player.subtract(mid);
   rel = rel.multiply(1 / dolly);  // zoom in -> dolly > 1 -> move closer
   rel = rotateAroundY(rel, yaw);  // orbit for rotation
-  desiredPos = twoHandAnchor.add(rel);
+  const next = twoHandAnchor.add(rel);
 
+  if (!isFiniteVec3(next)) { return; }
+
+  desiredPos = next;
   desiredRot = Quaternion.fromEuler(new Vector3(0, yaw, 0)).multiply(playerRot);
 
   Player.position.set(desiredPos);
@@ -354,8 +364,9 @@ function twoHandManipulate(leftHand: Vector3, rightHand: Vector3) {
 // In-world UI: zoom readout + spawn reticle
 // ---------------------------------------------------------------------------
 function ensureVisuals() {
-  if (!zoomLabel) {
+  if (BuildModeSettings.showZoomLabel && !zoomLabel) {
     // Dark panel (no collider, so it never blocks the spawn ray) + white text.
+    // Created hidden; positioned/oriented only when shown (never billboarded at origin).
     zoomLabel = spawnPrimitive.plane('Both', Vector3.zero, new Vector3(0.5, 0.18, 1), Quaternion.one, LABEL_BG_COLOR, 0.72, 'None', 'Empty', undefined);
 
     const text = new Entity(new Vector3(0, 0, 0.002), Quaternion.one, Vector3.one, zoomLabel, 'Empty');
@@ -366,11 +377,10 @@ function ensureVisuals() {
     text.text.doubleSided.set(true);
     zoomLabelTextEntity = text;
 
-    Billboard.start(zoomLabel, 'Freely'); // always face the player
     zoomLabel.visible.set(false);
   }
 
-  if (!reticle) {
+  if (BuildModeSettings.showReticle && !reticle) {
     reticle = new Entity(Vector3.zero, Quaternion.one, Vector3.one, undefined, 'Empty');
 
     const ring = buildRing(0.30, 0.45, 48);
@@ -386,7 +396,7 @@ function ensureVisuals() {
 
 /** Aim a ray from the chosen hand to the world and park the ring at the hit. */
 function updateReticle(gripCount: number) {
-  if (!reticle) { return; }
+  if (!BuildModeSettings.showReticle || !reticle) { return; }
 
   // Only aim when the hands are free, so the ring doesn't jump around mid-grab.
   if (gripCount !== 0) {
@@ -398,12 +408,12 @@ function updateReticle(gripCount: number) {
   const from = hand.position.get();
   const dir = hand.forward.get();
 
-  if (from && dir) {
+  if (from && dir && isFiniteVec3(from) && isFiniteVec3(dir)) {
     const hit = Raycast.directional(from, dir, BuildModeSettings.reticleMaxDistance, {});
 
-    if (hit) {
+    if (hit && isFiniteVec3(hit.pos)) {
       spawnTarget = hit.pos;
-      reticle.pos = hit.pos.add(new Vector3(0, 0.02, 0)); // lift slightly to avoid z-fighting
+      reticle.pos = new Vector3(hit.pos.x, hit.pos.y + 0.02, hit.pos.z); // lift to avoid z-fighting
       reticle.visible.set(true);
       return;
     }
@@ -429,10 +439,13 @@ function updateZoomLabel(gripCount: number) {
     const head = Player.head.position.get();
     const forward = Player.head.forward.get();
 
-    if (head && forward) {
-      zoomLabel.pos = head
+    if (head && forward && isFiniteVec3(head) && isFiniteVec3(forward)) {
+      const pos = head
         .add(forward.multiply(BuildModeSettings.zoomLabelDistance))
         .add(new Vector3(0, BuildModeSettings.zoomLabelHeightOffset, 0));
+
+      zoomLabel.pos = pos;
+      zoomLabel.rot = faceTowardHeadYaw(pos, head); // safe yaw-only facing (no NaN)
     }
 
     if (zoomLabelTextEntity) {
@@ -445,6 +458,22 @@ function updateZoomLabel(gripCount: number) {
 function hideBuildVisuals() {
   if (zoomLabel) { zoomLabel.visible.set(false); }
   if (reticle) { reticle.visible.set(false); }
+}
+
+
+/**
+ * Yaw-only rotation so a panel at `fromPos` faces the head. Unlike Quaternion.lookAt
+ * this can never divide by zero, so it cannot produce a NaN transform (engine crash).
+ */
+function faceTowardHeadYaw(fromPos: Vector3, headPos: Vector3): Quaternion {
+  const dx = headPos.x - fromPos.x;
+  const dz = headPos.z - fromPos.z;
+
+  if (Math.abs(dx) < 1e-5 && Math.abs(dz) < 1e-5) {
+    return Quaternion.one; // directly above / below: nothing sensible to face, stay flat
+  }
+
+  return Quaternion.fromEuler(new Vector3(0, Math.atan2(dx, dz), 0));
 }
 
 
@@ -473,8 +502,8 @@ function buildRing(inner: number, outer: number, segments: number): [Vector3[], 
     const oNext = ((i + 1) * 2) % count;
     const innNext = ((i + 1) * 2 + 1) % count;
 
-    triangles.push(o, oNext, inn, inn, oNext, innNext);     // front
-    triangles.push(inn, oNext, o, innNext, oNext, inn);     // back (double-sided)
+    triangles.push(o, oNext, inn, inn, oNext, innNext);   // front
+    triangles.push(inn, oNext, o, innNext, oNext, inn);   // back (double-sided)
   }
 
   return [verts, uvs, triangles];
@@ -497,6 +526,10 @@ function horizontalXZ(v: Vector3): Vector3 {
 
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
+}
+
+function isFiniteVec3(v: Vector3): boolean {
+  return Number.isFinite(v.x) && Number.isFinite(v.y) && Number.isFinite(v.z);
 }
 
 /** Signed angle (radians) from vector `a` to vector `b` about the world +Y axis. */
