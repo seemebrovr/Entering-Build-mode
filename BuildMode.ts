@@ -8,6 +8,7 @@ import { Events } from "./Yuu API/Events";
 import { Player } from "./Yuu API/Player";
 import { Raycast } from "./Yuu API/Raycast";
 import { registerStart } from "./Yuu API/RegisterStart";
+import { spawnPrimitive } from "./Yuu API/SpawnPrimitive";
 
 
 /**
@@ -17,17 +18,21 @@ import { registerStart } from "./Yuu API/RegisterStart";
  * around the world by physically grabbing space with the controller grips.
  *
  * CONTROLS
- *  - Toggle on / off : click BOTH thumbsticks at the same time. (Exiting this way does
- *                      NOT teleport - you just leave from where you are.)
+ *  - Toggle on / off : click BOTH thumbsticks at the same time. Exiting this way
+ *                      teleports you to the green SPAWN POINT (not straight down).
  *  - Move            : hold ONE grip and move your hand (grab & drag).
  *  - Rotate          : hold BOTH grips and twist.
  *  - Zoom            : hold BOTH grips and spread / squeeze your hands (pinch). The
  *                      current zoom shows as a "x" readout in front of you.
- *  - Spawn           : while in build mode, HOLD the LEFT thumbstick to show the spawn
+ *  - Spawn (ring)    : while in build mode, HOLD the LEFT thumbstick to show the spawn
  *                      ring - aim your LEFT hand down at a surface in front of you. The
- *                      ring sits on (and tilts to) whatever you point at - floor OR the
- *                      top of an object. RELEASE to teleport there and leave build mode.
- *                      Releasing while no ring is shown just cancels.
+ *                      ring sits on (and tilts to) whatever you point at. RELEASE to
+ *                      teleport there and leave build mode. (Disable via enableAimSpawn.)
+ *
+ * SPAWN POINT
+ *  - A light-green, non-collidable beacon marks a fixed home spot. Exiting with both
+ *    thumbsticks drops you there instead of falling from wherever you were flying.
+ *    Move it with BuildModeSettings.spawnPointPosition.
  *
  * WHY IT IS BUILT THIS WAY (API constraints)
  *  - Godot.events.onControllerInput only reports button *presses*; there is no
@@ -41,11 +46,10 @@ import { registerStart } from "./Yuu API/RegisterStart";
  *    back down. You float freely; on exit, normal movement and gravity resume.
  *
  * CRASH-SAFE UI
- *  - The zoom readout (text) and the spawn ring (mesh) are created ONCE at world load,
+ *  - The zoom readout, spawn ring, and spawn-point beacon are created ONCE at world load,
  *    then only shown / moved. Creating 3D objects mid-frame on enter was crashing the app.
- *  - The spawn ring uses a physics raycast to find the surface under your aim, but ONLY
- *    while the spawn stick is held, and ONLY from the physics step (onPhysicsUpdate) -
- *    which is where the engine's own ray-click system queries the world.
+ *  - The spawn ring uses a physics raycast ONLY while the spawn stick is held, and ONLY
+ *    from the physics step (onPhysicsUpdate) - where the engine's ray-click system queries.
  *  - Orientations are built with explicit quaternion maths (no Quaternion.lookAt, which
  *    can divide-by-zero -> NaN -> crash).
  *
@@ -81,10 +85,12 @@ export const BuildModeSettings = {
   /** Font size for the readout. */
   zoomLabelFontSize: 6,
 
-  // --- Spawn ring ---
+  // --- Spawn ring (LEFT-stick aim) ---
+  /** Allow the LEFT-stick aim ring. Set false if you only want the spawn point. */
+  enableAimSpawn: true,
   /** Show the spawn ring while the spawn stick is held (visual only). */
   showReticle: true,
-  /** On release, teleport to the ring spot and leave build mode. */
+  /** On release, teleport to the ring spot (the ring overrides the spawn point). */
   teleportOnExit: true,
   /** Aim with the right hand (false = left hand). */
   aimWithRightHand: false,
@@ -100,9 +106,17 @@ export const BuildModeSettings = {
   reticleDiameter: 0.6,
   /** Ring band thickness, in metres (smaller = thinner ring). */
   reticleThickness: 0.05,
-  /** Nudge the spawn point up / down if you land too low or high. */
-  spawnYOffset: 0,
 
+  // --- Spawn point (home beacon) ---
+  /** Teleport to the spawn point when you exit with both thumbsticks (instead of falling). */
+  useSpawnPointOnExit: true,
+  /** Where the spawn point is / where you land when exiting (floor point). */
+  spawnPointPosition: new Vector3(0, 0, 0),
+  /** Show the light-green spawn-point beacon in the world. */
+  showSpawnPoint: true,
+
+  /** Nudge any landing up / down if you spawn too low or high. */
+  spawnYOffset: 0,
   /** Print "Build Mode: ON/OFF" to the console when toggled. */
   logToggles: true,
 };
@@ -114,7 +128,7 @@ export const BuildModeSettings = {
 export const BuildMode = {
   /** Turn build mode on. */
   enable,
-  /** Turn build mode off (teleports to the aimed spot if there is one). */
+  /** Turn build mode off (teleports to the aimed ring, else the spawn point). */
   disable,
   /** Flip build mode on / off. */
   toggle,
@@ -155,9 +169,21 @@ function disable() {
 
   active = false; // stop holding -> normal movement + gravity resume
 
-  // Spawn the player at the spot they were aiming at, if any.
-  if (BuildModeSettings.teleportOnExit && spawnTarget && isFiniteVec3(spawnTarget)) {
-    Player.position.set(new Vector3(spawnTarget.x, spawnTarget.y + BuildModeSettings.spawnYOffset, spawnTarget.z));
+  // Where to land on exit: an aimed ring spot if you used the ring, otherwise the
+  // fixed spawn point (so exiting from high up sends you home, not straight down).
+  if (BuildModeSettings.teleportOnExit) {
+    let target: Vector3 | undefined;
+
+    if (spawnTarget && isFiniteVec3(spawnTarget)) {
+      target = spawnTarget;
+    }
+    else if (BuildModeSettings.useSpawnPointOnExit && isFiniteVec3(BuildModeSettings.spawnPointPosition)) {
+      target = BuildModeSettings.spawnPointPosition;
+    }
+
+    if (target) {
+      Player.position.set(new Vector3(target.x, target.y + BuildModeSettings.spawnYOffset, target.z));
+    }
   }
 
   spawnAiming = false;
@@ -174,7 +200,7 @@ function toggle() {
 
 // ---------------------------------------------------------------------------
 // Thumbstick gestures
-//   - BOTH sticks clicked  -> toggle build mode
+//   - BOTH sticks clicked  -> toggle build mode (exit teleports to the spawn point)
 //   - LEFT stick held      -> aim + show spawn ring; release -> spawn (teleport + exit)
 // ---------------------------------------------------------------------------
 let leftStickDown = false;
@@ -186,7 +212,7 @@ function reevaluateToggleGesture() {
   if (leftStickDown && rightStickDown) {
     if (toggleArmed) {
       toggleArmed = false;
-      // A both-stick toggle is NOT a spawn: cancel any spawn aim so it can't teleport.
+      // A both-stick toggle is NOT a ring spawn: clear the aim so exit uses the spawn point.
       spawnAiming = false;
       spawnTarget = undefined;
       toggle();
@@ -198,9 +224,9 @@ function reevaluateToggleGesture() {
 }
 
 function onSpawnStickPressed() {
-  // Begin a spawn aim only when in build mode and this is a single-stick press
-  // (if the other stick is also down it's a build-mode toggle, handled above).
-  if (active && !rightStickDown) {
+  // Begin a spawn aim only when in build mode, the ring is enabled, and this is a
+  // single-stick press (both sticks together is the build-mode toggle).
+  if (active && !rightStickDown && BuildModeSettings.enableAimSpawn) {
     spawnAiming = true;
   }
 }
@@ -244,14 +270,19 @@ let zoomLevel = 1;
 // ---------------------------------------------------------------------------
 // UI state
 // ---------------------------------------------------------------------------
-let zoomText: Entity | undefined;     // the "x" readout (text only, made at load)
-let zoomVisibleUntil = 0;             // timestamp the readout stays up until
+let zoomText: Entity | undefined;       // the "x" readout (text only, made at load)
+let zoomVisibleUntil = 0;               // timestamp the readout stays up until
 
-let reticle: Entity | undefined;      // spawn ring (mesh, made at load)
-let spawnTarget: Vector3 | undefined; // where the aim currently lands (surface point)
+let reticle: Entity | undefined;        // spawn ring (mesh, made at load)
+let spawnTarget: Vector3 | undefined;   // where the aim currently lands (surface point)
+
+let spawnPointEntity: Entity | undefined; // the light-green home beacon (made at load)
 
 const RETICLE_COLOR = new Color(0.29, 0.45, 1);
 const RETICLE_LIFT = 0.02; // metres along the surface normal, to avoid z-fighting
+
+const SPAWN_POINT_COLOR = new Color(0.55, 1, 0.55); // light green
+const SPAWN_BEACON_HEIGHT = 4; // metres
 
 
 // ---------------------------------------------------------------------------
@@ -272,9 +303,10 @@ function start() {
   Events.onUpdate(onUpdate);               // smooth, render-rate locomotion + zoom text
   Events.onPhysicsUpdate(onPhysicsUpdate); // gravity hold + spawn raycast (safe step)
 
-  // Create the UI ONCE, now (world load), not mid-frame on enter.
+  // Create all in-world objects ONCE, now (world load), not mid-frame on enter.
   createZoomText();
   createReticle();
+  createSpawnPoint();
 }
 
 
@@ -530,7 +562,30 @@ function isAimInFront(dir: Vector3): boolean {
 }
 
 
+// ---------------------------------------------------------------------------
+// Spawn point (light-green home beacon, created at world load)
+// ---------------------------------------------------------------------------
+function createSpawnPoint() {
+  if (!BuildModeSettings.showSpawnPoint || spawnPointEntity) { return; }
+
+  const p = BuildModeSettings.spawnPointPosition;
+
+  // A tall thin light-green beacon, base on the floor, NOT collidable, visual only.
+  spawnPointEntity = spawnPrimitive.cube(
+    new Vector3(p.x, p.y + SPAWN_BEACON_HEIGHT * 0.5, p.z),
+    new Vector3(0.3, SPAWN_BEACON_HEIGHT, 0.3),
+    Quaternion.one,
+    SPAWN_POINT_COLOR,
+    1,
+    false,    // not collidable
+    'Empty',  // visual only
+    undefined,
+  );
+}
+
+
 function hideBuildVisuals() {
+  // Note: the spawn-point beacon stays visible (it's a persistent world marker).
   if (zoomText) { zoomText.visible.set(false); }
   if (reticle) { reticle.visible.set(false); }
 }
