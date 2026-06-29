@@ -30,7 +30,7 @@ import { spawnPrimitive } from "./Yuu API/SpawnPrimitive";
  *                      teleport there and leave build mode. (Disable via enableAimSpawn.)
  *
  * SPAWN POINT
- *  - A light-green, non-collidable beacon marks a fixed home spot. Exiting with both
+ *  - A small light-green, non-collidable marker sits at a fixed home spot. Exiting with both
  *    thumbsticks drops you there instead of falling from wherever you were flying.
  *    Move it with BuildModeSettings.spawnPointPosition.
  *
@@ -112,8 +112,10 @@ export const BuildModeSettings = {
   useSpawnPointOnExit: true,
   /** Where the spawn point is / where you land when exiting (floor point). */
   spawnPointPosition: new Vector3(0, 0, 0),
-  /** Show the light-green spawn-point beacon in the world. */
+  /** Show the light-green spawn-point marker in the world. */
   showSpawnPoint: true,
+  /** Size (metres) of the small spawn-point cube marker. */
+  spawnPointSize: 0.3,
 
   /** Nudge any landing up / down if you spawn too low or high. */
   spawnYOffset: 0,
@@ -282,7 +284,6 @@ const RETICLE_COLOR = new Color(0.29, 0.45, 1);
 const RETICLE_LIFT = 0.02; // metres along the surface normal, to avoid z-fighting
 
 const SPAWN_POINT_COLOR = new Color(0.55, 1, 0.55); // light green
-const SPAWN_BEACON_HEIGHT = 4; // metres
 
 
 // ---------------------------------------------------------------------------
@@ -570,10 +571,11 @@ function createSpawnPoint() {
 
   const p = BuildModeSettings.spawnPointPosition;
 
-  // A tall thin light-green beacon, base on the floor, NOT collidable, visual only.
+  // A small light-green cube marker sitting on the floor, NOT collidable, visual only.
+  const size = BuildModeSettings.spawnPointSize;
   spawnPointEntity = spawnPrimitive.cube(
-    new Vector3(p.x, p.y + SPAWN_BEACON_HEIGHT * 0.5, p.z),
-    new Vector3(0.3, SPAWN_BEACON_HEIGHT, 0.3),
+    new Vector3(p.x, p.y + size * 0.5, p.z),
+    new Vector3(size, size, size),
     Quaternion.one,
     SPAWN_POINT_COLOR,
     1,
