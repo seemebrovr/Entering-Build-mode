@@ -6,6 +6,7 @@ import { Controller } from "./Yuu API/Controller";
 import { Entity } from "./Yuu API/Entity";
 import { Events } from "./Yuu API/Events";
 import { Player } from "./Yuu API/Player";
+import { Raycast } from "./Yuu API/Raycast";
 import { registerStart } from "./Yuu API/RegisterStart";
 
 
@@ -23,9 +24,10 @@ import { registerStart } from "./Yuu API/RegisterStart";
  *  - Zoom            : hold BOTH grips and spread / squeeze your hands (pinch). The
  *                      current zoom shows as a "x" readout in front of you.
  *  - Spawn           : while in build mode, HOLD the LEFT thumbstick to show the spawn
- *                      ring - aim your LEFT hand down at the floor in front of you (-Z).
- *                      RELEASE to teleport there and leave build mode. Releasing while no
- *                      ring is shown just cancels.
+ *                      ring - aim your LEFT hand down at a surface in front of you (-Z).
+ *                      The ring sits on whatever you point at (floor OR the top of an
+ *                      object). RELEASE to teleport there and leave build mode. Releasing
+ *                      while no ring is shown just cancels.
  *
  * WHY IT IS BUILT THIS WAY (API constraints)
  *  - Godot.events.onControllerInput only reports button *presses*; there is no
@@ -41,8 +43,10 @@ import { registerStart } from "./Yuu API/RegisterStart";
  * CRASH-SAFE UI
  *  - The zoom readout (text) and the spawn ring (mesh) are created ONCE at world load,
  *    then only shown / moved. Creating 3D objects mid-frame on enter was crashing the app.
- *  - The spawn point is found with PURE MATH (intersect the aim ray with the floor plane),
- *    NOT a physics raycast. A per-frame physics raycast here was crashing the app on enter.
+ *  - The spawn ring uses a physics raycast to find the surface under your aim, but ONLY
+ *    while the spawn stick is held, and ONLY from the physics step (onPhysicsUpdate) -
+ *    which is where the engine's own ray-click system queries the world. The earlier
+ *    crash was a raycast running every frame in the RENDER step the instant you entered.
  *  - The zoom text is billboarded by the engine (no Quaternion.lookAt, which can NaN).
  *
  * The grab maths re-derive from a fixed world anchor every frame, so movement and
@@ -86,7 +90,9 @@ export const BuildModeSettings = {
   aimWithRightHand: false,
   /** Only show the ring when aiming toward -Z (in front of you), not behind. */
   onlyAimNegativeZ: true,
-  /** Max distance (metres) the aim can place the spawn point. */
+  /** Only place the ring when aiming downward (so you land on tops, not walls). */
+  onlyAimDownward: true,
+  /** Max distance (metres) the aim ray reaches. */
   reticleMaxDistance: 1000,
   /** Diameter of the spawn ring, in metres. */
   reticleDiameter: 0.9,
@@ -124,9 +130,6 @@ let active = false;
 let desiredPos: Vector3 = Vector3.zero;
 let desiredRot: Quaternion = Quaternion.one;
 
-/** Floor height captured on entry; the spawn ring is projected onto this plane. */
-let groundY = 0;
-
 function enable() {
   if (active) { return; }
 
@@ -137,7 +140,7 @@ function enable() {
 
   // Start holding from wherever we currently are, so entering never snaps you.
   const startPos = Player.position.get();
-  if (startPos) { desiredPos = startPos; groundY = startPos.y; }
+  if (startPos) { desiredPos = startPos; }
   desiredRot = Player.rotation.get() ?? desiredRot;
 
   if (BuildModeSettings.logToggles) { console.log('Build Mode: ON'); }
@@ -241,7 +244,7 @@ let zoomText: Entity | undefined;     // the "x" readout (text only, made at loa
 let zoomVisibleUntil = 0;             // timestamp the readout stays up until
 
 let reticle: Entity | undefined;      // spawn ring (mesh, made at load)
-let spawnTarget: Vector3 | undefined; // where the aim currently lands on the floor
+let spawnTarget: Vector3 | undefined; // where the aim currently lands (surface point)
 
 const RETICLE_COLOR = new Color(0.29, 0.45, 1);
 
@@ -261,8 +264,8 @@ function start() {
   Controller.subscribe('rightGrip', 'Pressed', () => { rightGripDown = true; });
   Controller.subscribe('rightGrip', 'Released', () => { rightGripDown = false; });
 
-  Events.onUpdate(onUpdate);               // smooth, render-rate locomotion + UI
-  Events.onPhysicsUpdate(onPhysicsUpdate); // re-assert pose so gravity can't win
+  Events.onUpdate(onUpdate);               // smooth, render-rate locomotion + zoom text
+  Events.onPhysicsUpdate(onPhysicsUpdate); // gravity hold + spawn raycast (safe step)
 
   // Create the UI ONCE, now (world load), not mid-frame on enter.
   createZoomText();
@@ -271,7 +274,7 @@ function start() {
 
 
 // ---------------------------------------------------------------------------
-// Per-frame locomotion (process / render rate)
+// Per-frame locomotion (process / render rate) - no physics queries here
 // ---------------------------------------------------------------------------
 function onUpdate(_deltaTime: number) {
   if (!active) {
@@ -303,18 +306,18 @@ function onUpdate(_deltaTime: number) {
   // floating instead of falling.
   holdPose();
 
-  // In-world UI.
-  updateReticle();
+  // Zoom readout (no physics query - safe in the render step).
   updateZoomLabel(gripCount);
 }
 
 
 // ---------------------------------------------------------------------------
-// Per-physics-frame hold (this is what actually beats gravity)
+// Per-physics-frame: gravity hold + the spawn raycast (physics queries belong here)
 // ---------------------------------------------------------------------------
 function onPhysicsUpdate(_deltaTime: number) {
   if (!active) { return; }
   holdPose();
+  updateReticle();
 }
 
 
@@ -446,7 +449,7 @@ function createReticle() {
   if (!BuildModeSettings.showReticle || reticle) { return; }
 
   // Same proven path as spawnPrimitive: an entity + mesh.create + mesh.color.set.
-  // No collider, no emission - kept simple.
+  // No collider (so the spawn ray never hits the ring itself), no emission.
   reticle = new Entity(Vector3.zero, Quaternion.one, Vector3.one, undefined, 'Empty');
 
   const radius = BuildModeSettings.reticleDiameter * 0.5;
@@ -459,8 +462,9 @@ function createReticle() {
 
 
 /**
- * While the spawn stick is held, work out where the player will land (pure math: where
- * the aim ray meets the floor plane) and park the ring there. No physics raycast.
+ * While the spawn stick is held, raycast from the aiming hand to find the surface
+ * (floor OR the top of an object) and park the ring there. Runs only in the physics
+ * step and only while aiming, which is what keeps the raycast from crashing.
  */
 function updateReticle() {
   if (!spawnAiming) {
@@ -469,7 +473,7 @@ function updateReticle() {
     return;
   }
 
-  spawnTarget = aimFloorPoint();
+  spawnTarget = aimSurfacePoint();
 
   if (reticle) {
     if (spawnTarget) {
@@ -483,21 +487,20 @@ function updateReticle() {
 }
 
 
-/** Intersect the aiming hand's forward ray with the floor plane (y = groundY). */
-function aimFloorPoint(): Vector3 | undefined {
+/** Raycast the aiming hand's forward ray and return the first surface hit. */
+function aimSurfacePoint(): Vector3 | undefined {
   const hand = BuildModeSettings.aimWithRightHand ? Player.rightHand : Player.leftHand;
   const from = hand.position.get();
   const dir = hand.forward.get();
 
   if (!from || !dir || !isFiniteVec3(from) || !isFiniteVec3(dir)) { return undefined; }
-  if (dir.y >= -0.001) { return undefined; }                         // not pointing downward
-  if (BuildModeSettings.onlyAimNegativeZ && dir.z >= 0) { return undefined; } // only toward -Z (in front)
-  if (from.y <= groundY) { return undefined; }                       // already at / below the floor
+  if (BuildModeSettings.onlyAimDownward && dir.y >= -0.001) { return undefined; }   // aim downward
+  if (BuildModeSettings.onlyAimNegativeZ && dir.z >= 0) { return undefined; }       // toward -Z
 
-  const t = (groundY - from.y) / dir.y; // distance along the ray to reach the floor
-  if (t <= 0 || t > BuildModeSettings.reticleMaxDistance) { return undefined; }
+  const hit = Raycast.directional(from, dir, BuildModeSettings.reticleMaxDistance, {});
+  if (hit && isFiniteVec3(hit.pos)) { return hit.pos; }
 
-  return new Vector3(from.x + dir.x * t, groundY, from.z + dir.z * t);
+  return undefined;
 }
 
 

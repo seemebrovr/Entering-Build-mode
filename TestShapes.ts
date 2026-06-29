@@ -8,13 +8,14 @@ import { spawnPrimitive } from "./Yuu API/SpawnPrimitive";
 /**
  * Test Shapes
  * ===========
- * Scatters a handful of colored primitives around the world at different heights so
- * Build Mode (fly / zoom / spawn ring) has things to navigate around, zoom into, and
- * aim near. Everything is created ONCE at world load (the crash-safe pattern), in
- * front of you (toward -Z) where the spawn ring shows.
+ * Scatters colored primitives around the world at different heights so Build Mode
+ * (fly / zoom / spawn ring) has things to navigate around, zoom into, and LAND ON.
  *
- * Visual only (no colliders) so they never get in the way while you test. To remove
- * them, delete the `import "./TestShapes";` line from Main.ts, or set ENABLED = false.
+ * These are Static colliders (cubes/pillars = box, spheres/cones = convex), so the
+ * spawn ring can sit on their tops and you teleport onto them. Created ONCE at world
+ * load (the crash-safe pattern), in front of you (toward -Z).
+ *
+ * To remove them, delete `import "./TestShapes";` from Main.ts, or set ENABLED = false.
  */
 
 const ENABLED = true;
@@ -29,10 +30,10 @@ registerStart(spawnTestShapes);
 function spawnTestShapes() {
   if (!ENABLED) { return; }
 
-  // Cubes marching forward (-Z) and climbing in height.
+  // Cubes marching forward (-Z) and climbing in height - flat tops to land on.
   for (let i = 0; i < 6; i++) {
     const pos = new Vector3(-5 + i * 2, 0.5 + i, -3 - i * 1.5);
-    spawnPrimitive.cube(pos, Vector3.one, Quaternion.one, palette[i % palette.length], 1, false, 'Empty', undefined);
+    spawnPrimitive.cube(pos, Vector3.one, Quaternion.one, palette[i % palette.length], 1, true, 'Static', undefined);
   }
 
   // Floating spheres at a range of heights, off to the sides.
@@ -43,7 +44,7 @@ function spawnTestShapes() {
     new Vector3(3, 6.5, -11),
   ];
   spheres.forEach((p, i) => {
-    spawnPrimitive.sphere(16, 12, p, 1.2, Quaternion.one, palette[(i + 3) % palette.length], 1, 'None', 'Empty', undefined);
+    spawnPrimitive.sphere(16, 12, p, 1.2, Quaternion.one, palette[(i + 3) % palette.length], 1, 'Convex', 'Static', undefined);
   });
 
   // Cones sitting on the floor - handy markers for aiming the spawn ring.
@@ -53,12 +54,12 @@ function spawnTestShapes() {
     new Vector3(0, 0.5, -8),
   ];
   cones.forEach((p, i) => {
-    spawnPrimitive.cone(16, p, 1, Quaternion.one, palette[(i + 6) % palette.length], 1, 'None', 'Empty', undefined);
+    spawnPrimitive.cone(16, p, 1, Quaternion.one, palette[(i + 6) % palette.length], 1, 'Convex', 'Static', undefined);
   });
 
-  // Tall pillars to fly up alongside and gauge height while zooming.
+  // Tall pillars with big flat tops to fly up and land on.
   for (let i = 0; i < 3; i++) {
     const pos = new Vector3(-8 + i * 8, 4, -13);
-    spawnPrimitive.cube(pos, new Vector3(1, 8, 1), Quaternion.one, Color.white, 1, false, 'Empty', undefined);
+    spawnPrimitive.cube(pos, new Vector3(2, 8, 2), Quaternion.one, Color.white, 1, true, 'Static', undefined);
   }
 }
