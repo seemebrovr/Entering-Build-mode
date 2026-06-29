@@ -8,7 +8,6 @@ import { Events } from "./Yuu API/Events";
 import { Player } from "./Yuu API/Player";
 import { Raycast } from "./Yuu API/Raycast";
 import { registerStart } from "./Yuu API/RegisterStart";
-import { spawnPrimitive } from "./Yuu API/SpawnPrimitive";
 
 
 /**
@@ -19,7 +18,6 @@ import { spawnPrimitive } from "./Yuu API/SpawnPrimitive";
  *
  * CONTROLS
  *  - Toggle on / off : click BOTH thumbsticks in at the same time.
- *                      On exit you spawn at the ring you are pointing at (if any).
  *  - Move            : hold ONE grip and move your hand. The world stays stuck to
  *                      your hand, pulling you through space (grab & drag).
  *  - Rotate          : hold BOTH grips and twist. The world yaws to follow the line
@@ -27,8 +25,6 @@ import { spawnPrimitive } from "./Yuu API/SpawnPrimitive";
  *  - Zoom            : hold BOTH grips and spread / squeeze your hands. Pinch to zoom
  *                      in and out, clamped between a min and a max. The current zoom is
  *                      shown as a "x" readout in front of you.
- *  - Aim spawn       : with hands free, point your aiming hand at the world. A ring
- *                      shows where you will land when you leave build mode.
  *
  * WHY IT IS BUILT THIS WAY (API constraints)
  *  - Godot.events.onControllerInput only reports button *presses*; there is no
@@ -42,9 +38,12 @@ import { spawnPrimitive } from "./Yuu API/SpawnPrimitive";
  *    back down. You float freely; on exit, normal movement and gravity resume.
  *    (A true "only my hands collide, my body has no collider" would need a new
  *    engine-side function, like the other C++ TODOs in this codebase.)
- *  - The zoom panel is faced toward you with a safe yaw-only calculation rather than the
- *    Billboard module: Billboard uses Quaternion.lookAt, which divides by zero (NaN ->
- *    engine crash) when the panel sits at the world origin and your head is above it.
+ *
+ * CRASH-SAFE UI
+ *  - The zoom readout is a plain TEXT node, created ONCE when the world loads (not the
+ *    moment you enter build mode). Creating 3D objects mid-frame on enter was crashing
+ *    the app; making the text up front and only showing / moving it avoids that. The
+ *    engine billboards the text, so there is no Quaternion.lookAt (which can NaN -> crash).
  *
  * The grab maths re-derive from a fixed world anchor every frame, so movement and
  * rotation self-correct, never drift, and naturally cancel any gravity nudge.
@@ -66,9 +65,9 @@ export const BuildModeSettings = {
   /** Hold the rig in place against gravity / ground-snap while build mode is active. */
   holdAgainstGravity: true,
 
-  // --- Zoom readout (the "14.5x" panel) ---
+  // --- Zoom readout (the "x" text) ---
   /** Show the zoom indicator while pinching. */
-  showZoomLabel: false, // TEMP: off while we isolate the on-enter crash
+  showZoomLabel: true,
   /** Metres in front of your head to float the readout. */
   zoomLabelDistance: 1.5,
   /** Metres below eye level for the readout. */
@@ -78,9 +77,9 @@ export const BuildModeSettings = {
   /** Font size for the readout. */
   zoomLabelFontSize: 6,
 
-  // --- Exit spawn reticle ---
+  // --- Exit spawn reticle (still OFF; re-add next, the same crash-safe way) ---
   /** Show the spawn ring while aiming with hands free. */
-  showReticle: false, // TEMP: off while we isolate the on-enter crash
+  showReticle: false,
   /** On exit, teleport to the ring you are pointing at (if any). */
   teleportOnExit: true,
   /** Aim the spawn ring with the right hand (false = left hand). */
@@ -198,17 +197,15 @@ let zoomLevel = 1;
 
 
 // ---------------------------------------------------------------------------
-// UI state (zoom readout + spawn reticle)
+// UI state
 // ---------------------------------------------------------------------------
-let zoomLabel: Entity | undefined;           // background panel
-let zoomLabelTextEntity: Entity | undefined; // child text node
-let zoomVisibleUntil = 0;                     // timestamp the readout stays up until
+let zoomText: Entity | undefined;     // the "x" readout (text only, made at load)
+let zoomVisibleUntil = 0;             // timestamp the readout stays up until
 
-let reticle: Entity | undefined;             // ring marker on the ground
-let spawnTarget: Vector3 | undefined;        // where the ray currently hits
+let reticle: Entity | undefined;      // spawn ring (still disabled for now)
+let spawnTarget: Vector3 | undefined; // where the spawn ray currently hits
 
 const RETICLE_COLOR = new Color(0.29, 0.45, 1);
-const LABEL_BG_COLOR = new Color(0.05, 0.05, 0.08);
 
 
 // ---------------------------------------------------------------------------
@@ -228,6 +225,9 @@ function start() {
 
   Events.onUpdate(onUpdate);               // smooth, render-rate locomotion + UI
   Events.onPhysicsUpdate(onPhysicsUpdate); // re-assert pose so gravity can't win
+
+  // Create the zoom readout ONCE, now (world load), not mid-frame on enter.
+  createZoomText();
 }
 
 
@@ -265,7 +265,6 @@ function onUpdate(_deltaTime: number) {
   holdPose();
 
   // In-world UI.
-  ensureVisuals();
   updateReticle(gripCount);
   updateZoomLabel(gripCount);
 }
@@ -361,44 +360,52 @@ function twoHandManipulate(leftHand: Vector3, rightHand: Vector3) {
 
 
 // ---------------------------------------------------------------------------
-// In-world UI: zoom readout + spawn reticle
+// Zoom readout (text only, created at world load)
 // ---------------------------------------------------------------------------
-function ensureVisuals() {
-  if (BuildModeSettings.showZoomLabel && !zoomLabel) {
-    // Dark panel (no collider, so it never blocks the spawn ray) + white text.
-    // Created hidden; positioned/oriented only when shown (never billboarded at origin).
-    zoomLabel = spawnPrimitive.plane('Both', Vector3.zero, new Vector3(0.5, 0.18, 1), Quaternion.one, LABEL_BG_COLOR, 0.72, 'None', 'Empty', undefined);
+function createZoomText() {
+  if (!BuildModeSettings.showZoomLabel || zoomText) { return; }
 
-    const text = new Entity(new Vector3(0, 0, 0.002), Quaternion.one, Vector3.one, zoomLabel, 'Empty');
-    text.text.create('', BuildModeSettings.zoomLabelFontSize, 1);
-    text.text.color.set(Color.white);
-    text.text.outline.set(1);
-    text.text.outline.color.set(Color.black);
-    text.text.doubleSided.set(true);
-    zoomLabelTextEntity = text;
+  // Same proven pattern as the in-world console: a Static node with a text child.
+  zoomText = new Entity(Vector3.up, Quaternion.one, Vector3.one, undefined, 'Static');
+  zoomText.text.create('', BuildModeSettings.zoomLabelFontSize, 0);
+  zoomText.text.color.set(Color.black);
+  zoomText.text.billboard.set(true); // engine faces it toward you (no lookAt / NaN)
+  zoomText.visible.set(false);
+}
 
-    zoomLabel.visible.set(false);
+
+/** Float the "x" readout in front of the head while zooming. */
+function updateZoomLabel(gripCount: number) {
+  if (!zoomText) { return; }
+
+  if (gripCount === 2) {
+    zoomVisibleUntil = Date.now() + BuildModeSettings.zoomLabelLingerMs;
   }
 
-  if (BuildModeSettings.showReticle && !reticle) {
-    reticle = new Entity(Vector3.zero, Quaternion.one, Vector3.one, undefined, 'Empty');
+  const show = Date.now() < zoomVisibleUntil;
+  zoomText.visible.set(show);
 
-    const ring = buildRing(0.30, 0.45, 48);
-    reticle.mesh.create(ring[0], ring[1], ring[2]);
-    reticle.mesh.color.set(RETICLE_COLOR, 1);
-    reticle.mesh.material.emissionColor.set(RETICLE_COLOR);
-    reticle.mesh.material.emissionStrength.set(0.6);
+  if (show) {
+    const head = Player.head.position.get();
+    const forward = Player.head.forward.get();
 
-    reticle.visible.set(false);
+    if (head && forward && isFiniteVec3(head) && isFiniteVec3(forward)) {
+      zoomText.pos = head
+        .add(forward.multiply(BuildModeSettings.zoomLabelDistance))
+        .add(new Vector3(0, BuildModeSettings.zoomLabelHeightOffset, 0));
+    }
+
+    zoomText.text.display.set(zoomLevel.toFixed(1) + 'x');
   }
 }
 
 
-/** Aim a ray from the chosen hand to the world and park the ring at the hit. */
+// ---------------------------------------------------------------------------
+// Spawn reticle (still disabled - will be re-added the same crash-safe way)
+// ---------------------------------------------------------------------------
 function updateReticle(gripCount: number) {
   if (!BuildModeSettings.showReticle || !reticle) { return; }
 
-  // Only aim when the hands are free, so the ring doesn't jump around mid-grab.
   if (gripCount !== 0) {
     reticle.visible.set(false);
     return;
@@ -413,7 +420,7 @@ function updateReticle(gripCount: number) {
 
     if (hit && isFiniteVec3(hit.pos)) {
       spawnTarget = hit.pos;
-      reticle.pos = new Vector3(hit.pos.x, hit.pos.y + 0.02, hit.pos.z); // lift to avoid z-fighting
+      reticle.pos = new Vector3(hit.pos.x, hit.pos.y + 0.02, hit.pos.z);
       reticle.visible.set(true);
       return;
     }
@@ -424,56 +431,9 @@ function updateReticle(gripCount: number) {
 }
 
 
-/** Float the "x" readout in front of the head while zooming. */
-function updateZoomLabel(gripCount: number) {
-  if (!BuildModeSettings.showZoomLabel || !zoomLabel) { return; }
-
-  if (gripCount === 2) {
-    zoomVisibleUntil = Date.now() + BuildModeSettings.zoomLabelLingerMs;
-  }
-
-  const show = Date.now() < zoomVisibleUntil;
-  zoomLabel.visible.set(show);
-
-  if (show) {
-    const head = Player.head.position.get();
-    const forward = Player.head.forward.get();
-
-    if (head && forward && isFiniteVec3(head) && isFiniteVec3(forward)) {
-      const pos = head
-        .add(forward.multiply(BuildModeSettings.zoomLabelDistance))
-        .add(new Vector3(0, BuildModeSettings.zoomLabelHeightOffset, 0));
-
-      zoomLabel.pos = pos;
-      zoomLabel.rot = faceTowardHeadYaw(pos, head); // safe yaw-only facing (no NaN)
-    }
-
-    if (zoomLabelTextEntity) {
-      zoomLabelTextEntity.text.display.set(zoomLevel.toFixed(1) + 'x');
-    }
-  }
-}
-
-
 function hideBuildVisuals() {
-  if (zoomLabel) { zoomLabel.visible.set(false); }
+  if (zoomText) { zoomText.visible.set(false); }
   if (reticle) { reticle.visible.set(false); }
-}
-
-
-/**
- * Yaw-only rotation so a panel at `fromPos` faces the head. Unlike Quaternion.lookAt
- * this can never divide by zero, so it cannot produce a NaN transform (engine crash).
- */
-function faceTowardHeadYaw(fromPos: Vector3, headPos: Vector3): Quaternion {
-  const dx = headPos.x - fromPos.x;
-  const dz = headPos.z - fromPos.z;
-
-  if (Math.abs(dx) < 1e-5 && Math.abs(dz) < 1e-5) {
-    return Quaternion.one; // directly above / below: nothing sensible to face, stay flat
-  }
-
-  return Quaternion.fromEuler(new Vector3(0, Math.atan2(dx, dz), 0));
 }
 
 
@@ -488,8 +448,8 @@ function buildRing(inner: number, outer: number, segments: number): [Vector3[], 
     const c = Math.cos(angle);
     const s = Math.sin(angle);
 
-    verts.push(new Vector3(c * outer, 0, s * outer)); // outer ring  (index 2i)
-    verts.push(new Vector3(c * inner, 0, s * inner)); // inner ring  (index 2i + 1)
+    verts.push(new Vector3(c * outer, 0, s * outer));
+    verts.push(new Vector3(c * inner, 0, s * inner));
 
     uvs.push(new Vector2(i / segments, 1));
     uvs.push(new Vector2(i / segments, 0));
@@ -502,8 +462,8 @@ function buildRing(inner: number, outer: number, segments: number): [Vector3[], 
     const oNext = ((i + 1) * 2) % count;
     const innNext = ((i + 1) * 2 + 1) % count;
 
-    triangles.push(o, oNext, inn, inn, oNext, innNext);   // front
-    triangles.push(inn, oNext, o, innNext, oNext, inn);   // back (double-sided)
+    triangles.push(o, oNext, inn, inn, oNext, innNext);
+    triangles.push(inn, oNext, o, innNext, oNext, inn);
   }
 
   return [verts, uvs, triangles];
