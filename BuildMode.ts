@@ -24,10 +24,10 @@ import { registerStart } from "./Yuu API/RegisterStart";
  *  - Zoom            : hold BOTH grips and spread / squeeze your hands (pinch). The
  *                      current zoom shows as a "x" readout in front of you.
  *  - Spawn           : while in build mode, HOLD the LEFT thumbstick to show the spawn
- *                      ring - aim your LEFT hand down at a surface in front of you (-Z).
- *                      The ring sits on whatever you point at (floor OR the top of an
- *                      object). RELEASE to teleport there and leave build mode. Releasing
- *                      while no ring is shown just cancels.
+ *                      ring - aim your LEFT hand down at a surface in front of you. The
+ *                      ring sits on (and tilts to) whatever you point at - floor OR the
+ *                      top of an object. RELEASE to teleport there and leave build mode.
+ *                      Releasing while no ring is shown just cancels.
  *
  * WHY IT IS BUILT THIS WAY (API constraints)
  *  - Godot.events.onControllerInput only reports button *presses*; there is no
@@ -45,9 +45,9 @@ import { registerStart } from "./Yuu API/RegisterStart";
  *    then only shown / moved. Creating 3D objects mid-frame on enter was crashing the app.
  *  - The spawn ring uses a physics raycast to find the surface under your aim, but ONLY
  *    while the spawn stick is held, and ONLY from the physics step (onPhysicsUpdate) -
- *    which is where the engine's own ray-click system queries the world. The earlier
- *    crash was a raycast running every frame in the RENDER step the instant you entered.
- *  - The zoom text is billboarded by the engine (no Quaternion.lookAt, which can NaN).
+ *    which is where the engine's own ray-click system queries the world.
+ *  - Orientations are built with explicit quaternion maths (no Quaternion.lookAt, which
+ *    can divide-by-zero -> NaN -> crash).
  *
  * The grab maths re-derive from a fixed world anchor every frame, so movement and
  * rotation self-correct, never drift, and naturally cancel any gravity nudge.
@@ -88,14 +88,18 @@ export const BuildModeSettings = {
   teleportOnExit: true,
   /** Aim with the right hand (false = left hand). */
   aimWithRightHand: false,
-  /** Only show the ring when aiming toward -Z (in front of you), not behind. */
-  onlyAimNegativeZ: true,
+  /** Only place the ring when aiming in front of you (relative to where you're looking). */
+  onlyAimInFront: true,
   /** Only place the ring when aiming downward (so you land on tops, not walls). */
   onlyAimDownward: true,
+  /** Tilt the ring to match the angle of the surface it sits on. */
+  matchSurfaceAngle: true,
   /** Max distance (metres) the aim ray reaches. */
   reticleMaxDistance: 1000,
-  /** Diameter of the spawn ring, in metres. */
-  reticleDiameter: 0.9,
+  /** Outer diameter of the spawn ring, in metres. */
+  reticleDiameter: 0.6,
+  /** Ring band thickness, in metres (smaller = thinner ring). */
+  reticleThickness: 0.05,
   /** Nudge the spawn point up / down if you land too low or high. */
   spawnYOffset: 0,
 
@@ -247,6 +251,7 @@ let reticle: Entity | undefined;      // spawn ring (mesh, made at load)
 let spawnTarget: Vector3 | undefined; // where the aim currently lands (surface point)
 
 const RETICLE_COLOR = new Color(0.29, 0.45, 1);
+const RETICLE_LIFT = 0.02; // metres along the surface normal, to avoid z-fighting
 
 
 // ---------------------------------------------------------------------------
@@ -452,8 +457,9 @@ function createReticle() {
   // No collider (so the spawn ray never hits the ring itself), no emission.
   reticle = new Entity(Vector3.zero, Quaternion.one, Vector3.one, undefined, 'Empty');
 
-  const radius = BuildModeSettings.reticleDiameter * 0.5;
-  const ring = buildRing(radius * 0.66, radius, 48);
+  const outer = Math.max(0.01, BuildModeSettings.reticleDiameter * 0.5);
+  const inner = Math.max(0.005, outer - BuildModeSettings.reticleThickness);
+  const ring = buildRing(inner, outer, 48);
   reticle.mesh.create(ring[0], ring[1], ring[2]);
   reticle.mesh.color.set(RETICLE_COLOR, 1);
 
@@ -463,8 +469,8 @@ function createReticle() {
 
 /**
  * While the spawn stick is held, raycast from the aiming hand to find the surface
- * (floor OR the top of an object) and park the ring there. Runs only in the physics
- * step and only while aiming, which is what keeps the raycast from crashing.
+ * (floor OR the top of an object), sit the ring on it and tilt it to match. Runs only
+ * in the physics step and only while aiming, which keeps the raycast from crashing.
  */
 function updateReticle() {
   if (!spawnAiming) {
@@ -473,34 +479,54 @@ function updateReticle() {
     return;
   }
 
-  spawnTarget = aimSurfacePoint();
+  const hit = aimSurfaceHit();
 
-  if (reticle) {
-    if (spawnTarget) {
-      reticle.pos = new Vector3(spawnTarget.x, spawnTarget.y + 0.02, spawnTarget.z); // lift to avoid z-fighting
+  if (hit) {
+    spawnTarget = hit.pos;
+
+    if (reticle) {
+      reticle.pos = hit.pos.add(hit.normal.multiply(RETICLE_LIFT));
+      reticle.rot = BuildModeSettings.matchSurfaceAngle ? rotationFromUpTo(hit.normal) : Quaternion.one;
       reticle.visible.set(true);
     }
-    else {
-      reticle.visible.set(false);
-    }
+  }
+  else {
+    spawnTarget = undefined;
+    if (reticle) { reticle.visible.set(false); }
   }
 }
 
 
-/** Raycast the aiming hand's forward ray and return the first surface hit. */
-function aimSurfacePoint(): Vector3 | undefined {
+/** Raycast the aiming hand's forward ray and return the first surface hit (pos + normal). */
+function aimSurfaceHit(): { pos: Vector3, normal: Vector3 } | undefined {
   const hand = BuildModeSettings.aimWithRightHand ? Player.rightHand : Player.leftHand;
   const from = hand.position.get();
   const dir = hand.forward.get();
 
   if (!from || !dir || !isFiniteVec3(from) || !isFiniteVec3(dir)) { return undefined; }
-  if (BuildModeSettings.onlyAimDownward && dir.y >= -0.001) { return undefined; }   // aim downward
-  if (BuildModeSettings.onlyAimNegativeZ && dir.z >= 0) { return undefined; }       // toward -Z
+  if (BuildModeSettings.onlyAimDownward && dir.y >= -0.001) { return undefined; } // aim downward
+
+  if (BuildModeSettings.onlyAimInFront && !isAimInFront(dir)) { return undefined; }
 
   const hit = Raycast.directional(from, dir, BuildModeSettings.reticleMaxDistance, {});
-  if (hit && isFiniteVec3(hit.pos)) { return hit.pos; }
+  if (hit && isFiniteVec3(hit.pos)) {
+    const normal = (isFiniteVec3(hit.normal) && hit.normal.magnitude() > 1e-6) ? hit.normal : Vector3.up;
+    return { pos: hit.pos, normal: normal };
+  }
 
   return undefined;
+}
+
+
+/** True if the aim points the same horizontal way you're looking (in front of you). */
+function isAimInFront(dir: Vector3): boolean {
+  const facing = Player.head.forward.get();
+  if (!facing || !isFiniteVec3(facing)) { return true; } // can't tell -> don't block
+
+  const faceH = horizontalXZ(facing);
+  if (faceH.magnitude() < 0.001) { return true; } // looking straight up/down -> don't block
+
+  return horizontalXZ(dir).dot(faceH) > 0;
 }
 
 
@@ -563,6 +589,31 @@ function clamp(value: number, min: number, max: number): number {
 
 function isFiniteVec3(v: Vector3): boolean {
   return Number.isFinite(v.x) && Number.isFinite(v.y) && Number.isFinite(v.z);
+}
+
+/**
+ * Quaternion that rotates the world up axis (0,1,0) onto `n`. Used to lay the flat ring
+ * onto a surface with normal `n`. Built explicitly (no lookAt) so it can never NaN.
+ */
+function rotationFromUpTo(n: Vector3): Quaternion {
+  const len = n.magnitude();
+  if (len < 1e-6) { return Quaternion.one; }
+
+  const nx = n.x / len, ny = n.y / len, nz = n.z / len; // normalized normal
+  const dot = ny; // dot of (0,1,0) with the normal
+
+  if (dot > 0.9999) { return Quaternion.one; }                 // already pointing up
+  if (dot < -0.9999) { return new Quaternion(1, 0, 0, 0); }    // pointing straight down: flip
+
+  // half-way quaternion: (cross(up, n), 1 + dot(up, n)), normalized.
+  // cross((0,1,0), n) = (nz, 0, -nx)
+  return normalizeQuat(new Quaternion(nz, 0, -nx, 1 + dot));
+}
+
+function normalizeQuat(q: Quaternion): Quaternion {
+  const m = Math.sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
+  if (m < 1e-8) { return Quaternion.one; }
+  return new Quaternion(q.x / m, q.y / m, q.z / m, q.w / m);
 }
 
 /** Signed angle (radians) from vector `a` to vector `b` about the world +Y axis. */
