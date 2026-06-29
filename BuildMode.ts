@@ -6,7 +6,6 @@ import { Controller } from "./Yuu API/Controller";
 import { Entity } from "./Yuu API/Entity";
 import { Events } from "./Yuu API/Events";
 import { Player } from "./Yuu API/Player";
-import { Raycast } from "./Yuu API/Raycast";
 import { registerStart } from "./Yuu API/RegisterStart";
 
 
@@ -26,7 +25,7 @@ import { registerStart } from "./Yuu API/RegisterStart";
  *  - Zoom            : hold BOTH grips and spread / squeeze your hands. Pinch to zoom
  *                      in and out, clamped between a min and a max. The current zoom is
  *                      shown as a "x" readout in front of you.
- *  - Aim spawn       : with hands free, point your aiming hand at the world. A ring
+ *  - Aim spawn       : with hands free, point your aiming hand down at the floor. A ring
  *                      shows where you will land when you leave build mode.
  *
  * WHY IT IS BUILT THIS WAY (API constraints)
@@ -43,9 +42,12 @@ import { registerStart } from "./Yuu API/RegisterStart";
  *    engine-side function, like the other C++ TODOs in this codebase.)
  *
  * CRASH-SAFE UI
- *  - Both the zoom readout (text) and the spawn ring (mesh) are created ONCE when the
- *    world loads, then only shown / moved / updated. Creating 3D objects mid-frame the
- *    moment you enter build mode was crashing the app; building them up front avoids it.
+ *  - The zoom readout (text) and the spawn ring (mesh) are created ONCE at world load,
+ *    then only shown / moved. Creating 3D objects mid-frame on enter was crashing the app.
+ *  - The spawn point is found with PURE MATH (intersect the aim ray with the floor plane),
+ *    NOT a physics raycast. A per-frame physics raycast here was crashing the app on enter.
+ *    Trade-off: you spawn onto the floor plane (great for a flat world), not onto the tops
+ *    of arbitrary raised objects. That would need the engine raycast to be made safe first.
  *  - The zoom text is billboarded by the engine (no Quaternion.lookAt, which can NaN).
  *
  * The grab maths re-derive from a fixed world anchor every frame, so movement and
@@ -81,13 +83,13 @@ export const BuildModeSettings = {
   zoomLabelFontSize: 6,
 
   // --- Exit spawn reticle ---
-  /** Show the spawn ring while aiming with hands free. */
+  /** Show the spawn ring while aiming (visual only; teleport works even if this is off). */
   showReticle: true,
-  /** On exit, teleport to the ring you are pointing at (if any). */
+  /** On exit, teleport to the spot you are aiming at (if any). */
   teleportOnExit: true,
-  /** Aim the spawn ring with the right hand (false = left hand). */
+  /** Aim with the right hand (false = left hand). */
   aimWithRightHand: true,
-  /** Max distance (metres) the spawn ray reaches. */
+  /** Max distance (metres) the aim can place the spawn point. */
   reticleMaxDistance: 1000,
   /** Diameter of the spawn ring, in metres. */
   reticleDiameter: 0.9,
@@ -105,7 +107,7 @@ export const BuildModeSettings = {
 export const BuildMode = {
   /** Turn build mode on. */
   enable,
-  /** Turn build mode off (teleports to the aimed ring if there is one). */
+  /** Turn build mode off (teleports to the aimed spot if there is one). */
   disable,
   /** Flip build mode on / off. */
   toggle,
@@ -125,6 +127,9 @@ let active = false;
 let desiredPos: Vector3 = Vector3.zero;
 let desiredRot: Quaternion = Quaternion.one;
 
+/** Floor height captured on entry; the spawn ring is projected onto this plane. */
+let groundY = 0;
+
 function enable() {
   if (active) { return; }
 
@@ -133,7 +138,8 @@ function enable() {
   lastGripCount = -1;   // force grab references to re-seed on the next frame
 
   // Start holding from wherever we currently are, so entering never snaps you.
-  desiredPos = Player.position.get() ?? desiredPos;
+  const startPos = Player.position.get();
+  if (startPos) { desiredPos = startPos; groundY = startPos.y; }
   desiredRot = Player.rotation.get() ?? desiredRot;
 
   if (BuildModeSettings.logToggles) { console.log('Build Mode: ON'); }
@@ -144,7 +150,7 @@ function disable() {
 
   active = false; // stop holding -> normal movement + gravity resume
 
-  // Spawn the player at the ring they were pointing at, if any.
+  // Spawn the player at the spot they were aiming at, if any.
   if (BuildModeSettings.teleportOnExit && spawnTarget && isFiniteVec3(spawnTarget)) {
     Player.position.set(new Vector3(spawnTarget.x, spawnTarget.y + BuildModeSettings.spawnYOffset, spawnTarget.z));
   }
@@ -208,7 +214,7 @@ let zoomText: Entity | undefined;     // the "x" readout (text only, made at loa
 let zoomVisibleUntil = 0;             // timestamp the readout stays up until
 
 let reticle: Entity | undefined;      // spawn ring (mesh, made at load)
-let spawnTarget: Vector3 | undefined; // where the spawn ray currently hits
+let spawnTarget: Vector3 | undefined; // where the aim currently lands on the floor
 
 const RETICLE_COLOR = new Color(0.29, 0.45, 1);
 
@@ -413,7 +419,7 @@ function createReticle() {
   if (!BuildModeSettings.showReticle || reticle) { return; }
 
   // Same proven path as spawnPrimitive: an entity + mesh.create + mesh.color.set.
-  // No collider (so it never blocks the spawn ray), no emission (keep it simple).
+  // No collider, no emission - kept simple.
   reticle = new Entity(Vector3.zero, Quaternion.one, Vector3.one, undefined, 'Empty');
 
   const radius = BuildModeSettings.reticleDiameter * 0.5;
@@ -425,33 +431,40 @@ function createReticle() {
 }
 
 
-/** Aim a ray from the chosen hand to the world and park the ring at the hit. */
+/**
+ * Work out where the player will spawn (pure math: where the aim ray meets the floor
+ * plane at groundY), then park the ring there. No physics raycast, so it cannot crash.
+ */
 function updateReticle(gripCount: number) {
-  if (!reticle) { return; }
+  // Only aim when the hands are free, so it doesn't fight the grab gestures.
+  spawnTarget = (gripCount === 0) ? aimFloorPoint() : undefined;
 
-  // Only aim when the hands are free, so the ring doesn't jump around mid-grab.
-  if (gripCount !== 0) {
-    reticle.visible.set(false);
-    return;
+  if (reticle) {
+    if (spawnTarget) {
+      reticle.pos = new Vector3(spawnTarget.x, spawnTarget.y + 0.02, spawnTarget.z); // lift to avoid z-fighting
+      reticle.visible.set(true);
+    }
+    else {
+      reticle.visible.set(false);
+    }
   }
+}
 
+
+/** Intersect the aiming hand's forward ray with the floor plane (y = groundY). */
+function aimFloorPoint(): Vector3 | undefined {
   const hand = BuildModeSettings.aimWithRightHand ? Player.rightHand : Player.leftHand;
   const from = hand.position.get();
   const dir = hand.forward.get();
 
-  if (from && dir && isFiniteVec3(from) && isFiniteVec3(dir)) {
-    const hit = Raycast.directional(from, dir, BuildModeSettings.reticleMaxDistance, {});
+  if (!from || !dir || !isFiniteVec3(from) || !isFiniteVec3(dir)) { return undefined; }
+  if (dir.y >= -0.001) { return undefined; }   // not pointing downward
+  if (from.y <= groundY) { return undefined; } // already at / below the floor
 
-    if (hit && isFiniteVec3(hit.pos)) {
-      spawnTarget = hit.pos;
-      reticle.pos = new Vector3(hit.pos.x, hit.pos.y + 0.02, hit.pos.z); // lift to avoid z-fighting
-      reticle.visible.set(true);
-      return;
-    }
-  }
+  const t = (groundY - from.y) / dir.y; // distance along the ray to reach the floor
+  if (t <= 0 || t > BuildModeSettings.reticleMaxDistance) { return undefined; }
 
-  spawnTarget = undefined;
-  reticle.visible.set(false);
+  return new Vector3(from.x + dir.x * t, groundY, from.z + dir.z * t);
 }
 
 
