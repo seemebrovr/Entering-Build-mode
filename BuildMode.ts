@@ -18,6 +18,7 @@ import { registerStart } from "./Yuu API/RegisterStart";
  *
  * CONTROLS
  *  - Toggle on / off : click BOTH thumbsticks in at the same time.
+ *                      On exit you spawn at the ring you are pointing at (if any).
  *  - Move            : hold ONE grip and move your hand. The world stays stuck to
  *                      your hand, pulling you through space (grab & drag).
  *  - Rotate          : hold BOTH grips and twist. The world yaws to follow the line
@@ -25,6 +26,8 @@ import { registerStart } from "./Yuu API/RegisterStart";
  *  - Zoom            : hold BOTH grips and spread / squeeze your hands. Pinch to zoom
  *                      in and out, clamped between a min and a max. The current zoom is
  *                      shown as a "x" readout in front of you.
+ *  - Aim spawn       : with hands free, point your aiming hand at the world. A ring
+ *                      shows where you will land when you leave build mode.
  *
  * WHY IT IS BUILT THIS WAY (API constraints)
  *  - Godot.events.onControllerInput only reports button *presses*; there is no
@@ -40,10 +43,10 @@ import { registerStart } from "./Yuu API/RegisterStart";
  *    engine-side function, like the other C++ TODOs in this codebase.)
  *
  * CRASH-SAFE UI
- *  - The zoom readout is a plain TEXT node, created ONCE when the world loads (not the
- *    moment you enter build mode). Creating 3D objects mid-frame on enter was crashing
- *    the app; making the text up front and only showing / moving it avoids that. The
- *    engine billboards the text, so there is no Quaternion.lookAt (which can NaN -> crash).
+ *  - Both the zoom readout (text) and the spawn ring (mesh) are created ONCE when the
+ *    world loads, then only shown / moved / updated. Creating 3D objects mid-frame the
+ *    moment you enter build mode was crashing the app; building them up front avoids it.
+ *  - The zoom text is billboarded by the engine (no Quaternion.lookAt, which can NaN).
  *
  * The grab maths re-derive from a fixed world anchor every frame, so movement and
  * rotation self-correct, never drift, and naturally cancel any gravity nudge.
@@ -77,15 +80,17 @@ export const BuildModeSettings = {
   /** Font size for the readout. */
   zoomLabelFontSize: 6,
 
-  // --- Exit spawn reticle (still OFF; re-add next, the same crash-safe way) ---
+  // --- Exit spawn reticle ---
   /** Show the spawn ring while aiming with hands free. */
-  showReticle: false,
+  showReticle: true,
   /** On exit, teleport to the ring you are pointing at (if any). */
   teleportOnExit: true,
   /** Aim the spawn ring with the right hand (false = left hand). */
   aimWithRightHand: true,
   /** Max distance (metres) the spawn ray reaches. */
   reticleMaxDistance: 1000,
+  /** Diameter of the spawn ring, in metres. */
+  reticleDiameter: 0.9,
   /** Nudge the spawn point up / down if you land too low or high. */
   spawnYOffset: 0,
 
@@ -202,7 +207,7 @@ let zoomLevel = 1;
 let zoomText: Entity | undefined;     // the "x" readout (text only, made at load)
 let zoomVisibleUntil = 0;             // timestamp the readout stays up until
 
-let reticle: Entity | undefined;      // spawn ring (still disabled for now)
+let reticle: Entity | undefined;      // spawn ring (mesh, made at load)
 let spawnTarget: Vector3 | undefined; // where the spawn ray currently hits
 
 const RETICLE_COLOR = new Color(0.29, 0.45, 1);
@@ -226,8 +231,9 @@ function start() {
   Events.onUpdate(onUpdate);               // smooth, render-rate locomotion + UI
   Events.onPhysicsUpdate(onPhysicsUpdate); // re-assert pose so gravity can't win
 
-  // Create the zoom readout ONCE, now (world load), not mid-frame on enter.
+  // Create the UI ONCE, now (world load), not mid-frame on enter.
   createZoomText();
+  createReticle();
 }
 
 
@@ -401,11 +407,29 @@ function updateZoomLabel(gripCount: number) {
 
 
 // ---------------------------------------------------------------------------
-// Spawn reticle (still disabled - will be re-added the same crash-safe way)
+// Spawn ring (mesh, created at world load) + exit teleport
 // ---------------------------------------------------------------------------
-function updateReticle(gripCount: number) {
-  if (!BuildModeSettings.showReticle || !reticle) { return; }
+function createReticle() {
+  if (!BuildModeSettings.showReticle || reticle) { return; }
 
+  // Same proven path as spawnPrimitive: an entity + mesh.create + mesh.color.set.
+  // No collider (so it never blocks the spawn ray), no emission (keep it simple).
+  reticle = new Entity(Vector3.zero, Quaternion.one, Vector3.one, undefined, 'Empty');
+
+  const radius = BuildModeSettings.reticleDiameter * 0.5;
+  const ring = buildRing(radius * 0.66, radius, 48);
+  reticle.mesh.create(ring[0], ring[1], ring[2]);
+  reticle.mesh.color.set(RETICLE_COLOR, 1);
+
+  reticle.visible.set(false);
+}
+
+
+/** Aim a ray from the chosen hand to the world and park the ring at the hit. */
+function updateReticle(gripCount: number) {
+  if (!reticle) { return; }
+
+  // Only aim when the hands are free, so the ring doesn't jump around mid-grab.
   if (gripCount !== 0) {
     reticle.visible.set(false);
     return;
@@ -420,7 +444,7 @@ function updateReticle(gripCount: number) {
 
     if (hit && isFiniteVec3(hit.pos)) {
       spawnTarget = hit.pos;
-      reticle.pos = new Vector3(hit.pos.x, hit.pos.y + 0.02, hit.pos.z);
+      reticle.pos = new Vector3(hit.pos.x, hit.pos.y + 0.02, hit.pos.z); // lift to avoid z-fighting
       reticle.visible.set(true);
       return;
     }
