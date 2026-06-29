@@ -16,17 +16,16 @@ import { registerStart } from "./Yuu API/RegisterStart";
  * around the world by physically grabbing space with the controller grips.
  *
  * CONTROLS
- *  - Toggle on / off : click BOTH thumbsticks in at the same time.
- *                      On exit you spawn at the ring you are pointing at (if any).
- *  - Move            : hold ONE grip and move your hand. The world stays stuck to
- *                      your hand, pulling you through space (grab & drag).
- *  - Rotate          : hold BOTH grips and twist. The world yaws to follow the line
- *                      between your hands.
- *  - Zoom            : hold BOTH grips and spread / squeeze your hands. Pinch to zoom
- *                      in and out, clamped between a min and a max. The current zoom is
- *                      shown as a "x" readout in front of you.
- *  - Aim spawn       : with hands free, point your aiming hand down at the floor. A ring
- *                      shows where you will land when you leave build mode.
+ *  - Toggle on / off : click BOTH thumbsticks at the same time. (Exiting this way does
+ *                      NOT teleport - you just leave from where you are.)
+ *  - Move            : hold ONE grip and move your hand (grab & drag).
+ *  - Rotate          : hold BOTH grips and twist.
+ *  - Zoom            : hold BOTH grips and spread / squeeze your hands (pinch). The
+ *                      current zoom shows as a "x" readout in front of you.
+ *  - Spawn           : while in build mode, HOLD the LEFT thumbstick to show the spawn
+ *                      ring - aim your LEFT hand down at the floor in front of you (-Z).
+ *                      RELEASE to teleport there and leave build mode. Releasing while no
+ *                      ring is shown just cancels.
  *
  * WHY IT IS BUILT THIS WAY (API constraints)
  *  - Godot.events.onControllerInput only reports button *presses*; there is no
@@ -38,16 +37,12 @@ import { registerStart } from "./Yuu API/RegisterStart";
  *    OWNS the rig transform while active: it records a desired position and re-asserts
  *    it every process AND physics frame, so gravity / ground-snap can never pull you
  *    back down. You float freely; on exit, normal movement and gravity resume.
- *    (A true "only my hands collide, my body has no collider" would need a new
- *    engine-side function, like the other C++ TODOs in this codebase.)
  *
  * CRASH-SAFE UI
  *  - The zoom readout (text) and the spawn ring (mesh) are created ONCE at world load,
  *    then only shown / moved. Creating 3D objects mid-frame on enter was crashing the app.
  *  - The spawn point is found with PURE MATH (intersect the aim ray with the floor plane),
  *    NOT a physics raycast. A per-frame physics raycast here was crashing the app on enter.
- *    Trade-off: you spawn onto the floor plane (great for a flat world), not onto the tops
- *    of arbitrary raised objects. That would need the engine raycast to be made safe first.
  *  - The zoom text is billboarded by the engine (no Quaternion.lookAt, which can NaN).
  *
  * The grab maths re-derive from a fixed world anchor every frame, so movement and
@@ -82,13 +77,15 @@ export const BuildModeSettings = {
   /** Font size for the readout. */
   zoomLabelFontSize: 6,
 
-  // --- Exit spawn reticle ---
-  /** Show the spawn ring while aiming (visual only; teleport works even if this is off). */
+  // --- Spawn ring ---
+  /** Show the spawn ring while the spawn stick is held (visual only). */
   showReticle: true,
-  /** On exit, teleport to the spot you are aiming at (if any). */
+  /** On release, teleport to the ring spot and leave build mode. */
   teleportOnExit: true,
   /** Aim with the right hand (false = left hand). */
-  aimWithRightHand: true,
+  aimWithRightHand: false,
+  /** Only show the ring when aiming toward -Z (in front of you), not behind. */
+  onlyAimNegativeZ: true,
   /** Max distance (metres) the aim can place the spawn point. */
   reticleMaxDistance: 1000,
   /** Diameter of the spawn ring, in metres. */
@@ -136,6 +133,7 @@ function enable() {
   active = true;
   zoomLevel = 1;        // reset zoom each time you enter
   lastGripCount = -1;   // force grab references to re-seed on the next frame
+  spawnAiming = false;  // not aiming a spawn yet
 
   // Start holding from wherever we currently are, so entering never snaps you.
   const startPos = Player.position.get();
@@ -155,6 +153,7 @@ function disable() {
     Player.position.set(new Vector3(spawnTarget.x, spawnTarget.y + BuildModeSettings.spawnYOffset, spawnTarget.z));
   }
 
+  spawnAiming = false;
   hideBuildVisuals();
   spawnTarget = undefined;
 
@@ -167,21 +166,49 @@ function toggle() {
 
 
 // ---------------------------------------------------------------------------
-// Toggle gesture: both thumbsticks clicked in together
+// Thumbstick gestures
+//   - BOTH sticks clicked  -> toggle build mode
+//   - LEFT stick held      -> aim + show spawn ring; release -> spawn (teleport + exit)
 // ---------------------------------------------------------------------------
 let leftStickDown = false;
 let rightStickDown = false;
-let toggleArmed = true; // stops it firing repeatedly while both are held
+let toggleArmed = true;     // stops the toggle firing repeatedly while both are held
+let spawnAiming = false;    // true while the LEFT stick is held as a spawn aim
 
 function reevaluateToggleGesture() {
   if (leftStickDown && rightStickDown) {
     if (toggleArmed) {
       toggleArmed = false;
+      // A both-stick toggle is NOT a spawn: cancel any spawn aim so it can't teleport.
+      spawnAiming = false;
+      spawnTarget = undefined;
       toggle();
     }
   }
   else {
     toggleArmed = true; // re-arm once at least one stick is released
+  }
+}
+
+function onSpawnStickPressed() {
+  // Begin a spawn aim only when in build mode and this is a single-stick press
+  // (if the other stick is also down it's a build-mode toggle, handled above).
+  if (active && !rightStickDown) {
+    spawnAiming = true;
+  }
+}
+
+function onSpawnStickReleased() {
+  if (!spawnAiming) { return; }
+  spawnAiming = false;
+
+  if (active && spawnTarget && isFiniteVec3(spawnTarget)) {
+    disable(); // teleports to the ring + leaves build mode
+  }
+  else {
+    // No valid spot under the aim: just cancel and stay in build mode.
+    spawnTarget = undefined;
+    if (reticle) { reticle.visible.set(false); }
   }
 }
 
@@ -224,8 +251,8 @@ const RETICLE_COLOR = new Color(0.29, 0.45, 1);
 // ---------------------------------------------------------------------------
 registerStart(start);
 function start() {
-  Controller.subscribe('leftThumbstick', 'Pressed', () => { leftStickDown = true; reevaluateToggleGesture(); });
-  Controller.subscribe('leftThumbstick', 'Released', () => { leftStickDown = false; reevaluateToggleGesture(); });
+  Controller.subscribe('leftThumbstick', 'Pressed', () => { leftStickDown = true; reevaluateToggleGesture(); onSpawnStickPressed(); });
+  Controller.subscribe('leftThumbstick', 'Released', () => { leftStickDown = false; reevaluateToggleGesture(); onSpawnStickReleased(); });
   Controller.subscribe('rightThumbstick', 'Pressed', () => { rightStickDown = true; reevaluateToggleGesture(); });
   Controller.subscribe('rightThumbstick', 'Released', () => { rightStickDown = false; reevaluateToggleGesture(); });
 
@@ -277,7 +304,7 @@ function onUpdate(_deltaTime: number) {
   holdPose();
 
   // In-world UI.
-  updateReticle(gripCount);
+  updateReticle();
   updateZoomLabel(gripCount);
 }
 
@@ -413,7 +440,7 @@ function updateZoomLabel(gripCount: number) {
 
 
 // ---------------------------------------------------------------------------
-// Spawn ring (mesh, created at world load) + exit teleport
+// Spawn ring (mesh, created at world load)
 // ---------------------------------------------------------------------------
 function createReticle() {
   if (!BuildModeSettings.showReticle || reticle) { return; }
@@ -432,12 +459,17 @@ function createReticle() {
 
 
 /**
- * Work out where the player will spawn (pure math: where the aim ray meets the floor
- * plane at groundY), then park the ring there. No physics raycast, so it cannot crash.
+ * While the spawn stick is held, work out where the player will land (pure math: where
+ * the aim ray meets the floor plane) and park the ring there. No physics raycast.
  */
-function updateReticle(gripCount: number) {
-  // Only aim when the hands are free, so it doesn't fight the grab gestures.
-  spawnTarget = (gripCount === 0) ? aimFloorPoint() : undefined;
+function updateReticle() {
+  if (!spawnAiming) {
+    spawnTarget = undefined;
+    if (reticle) { reticle.visible.set(false); }
+    return;
+  }
+
+  spawnTarget = aimFloorPoint();
 
   if (reticle) {
     if (spawnTarget) {
@@ -458,8 +490,9 @@ function aimFloorPoint(): Vector3 | undefined {
   const dir = hand.forward.get();
 
   if (!from || !dir || !isFiniteVec3(from) || !isFiniteVec3(dir)) { return undefined; }
-  if (dir.y >= -0.001) { return undefined; }   // not pointing downward
-  if (from.y <= groundY) { return undefined; } // already at / below the floor
+  if (dir.y >= -0.001) { return undefined; }                         // not pointing downward
+  if (BuildModeSettings.onlyAimNegativeZ && dir.z >= 0) { return undefined; } // only toward -Z (in front)
+  if (from.y <= groundY) { return undefined; }                       // already at / below the floor
 
   const t = (groundY - from.y) / dir.y; // distance along the ray to reach the floor
   if (t <= 0 || t > BuildModeSettings.reticleMaxDistance) { return undefined; }
